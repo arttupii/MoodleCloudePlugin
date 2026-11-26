@@ -565,7 +565,15 @@ class api {
         }
         self::section($courseid, $record['section']); // Validate.
 
-        $instance = self::generator()->get_plugin_generator('mod_' . $modname)->create_instance((object)$record);
+        // Activities are created with Moodle's data generator, which fills in the defaults the edit form would.
+        // Its API is not guaranteed stable between Moodle versions; tests/e2e_test.py covers every module type.
+        try {
+            $modgenerator = self::generator()->get_plugin_generator('mod_' . $modname);
+        } catch (\coding_exception $e) {
+            throw new invalid_parameter_exception("Module '$modname' has no data generator, so it cannot be added "
+                . 'with add_module. Add it in the Moodle UI instead.');
+        }
+        $instance = $modgenerator->create_instance((object)$record);
         $cmid = (int)$instance->cmid;
 
         $stored = [];
@@ -1125,8 +1133,15 @@ class api {
      * @return array
      */
     protected static function begin_upload(array $args): array {
+        $dir = make_temp_directory('local_claudeapi');
+        // Purge uploads abandoned more than a day ago (interrupted restores).
+        foreach (glob($dir . '/*.bin') ?: [] as $old) {
+            if (filemtime($old) < time() - DAYSECS) {
+                @unlink($old);
+            }
+        }
         $id = random_string(24);
-        $path = make_temp_directory('local_claudeapi') . '/' . $id . '.bin';
+        $path = $dir . '/' . $id . '.bin';
         file_put_contents($path, '');
         return ['upload_id' => $id];
     }
@@ -1172,24 +1187,44 @@ class api {
 
         $backupdir = \restore_controller::get_tempdir_name(SITEID, $USER->id);
         $path = make_backup_temp_directory($backupdir);
-        get_file_packer('application/vnd.moodle.backup')->extract_to_pathname($mbz, $path);
+        $courseid = 0;
+        $rc = null;
+        try {
+            get_file_packer('application/vnd.moodle.backup')->extract_to_pathname($mbz, $path);
 
-        [$fullname, $shortname] = \restore_dbops::calculate_course_names(0,
-            get_string('restoringcourse', 'backup'), get_string('restoringcourseshortname', 'backup'));
-        $courseid = \restore_dbops::create_new_course($fullname, $shortname, $categoryid);
-        $rc = new \restore_controller($backupdir, $courseid, \backup::INTERACTIVE_NO, \backup::MODE_GENERAL,
-            $USER->id, \backup::TARGET_NEW_COURSE);
-        if (!$rc->execute_precheck()) {
-            $results = $rc->get_precheck_results();
-            if (!empty($results['errors'])) {
-                $rc->destroy();
-                delete_course($courseid, false);
-                throw new moodle_exception('Restore precheck failed: ' . json_encode($results['errors']));
+            [$fullname, $shortname] = \restore_dbops::calculate_course_names(0,
+                get_string('restoringcourse', 'backup'), get_string('restoringcourseshortname', 'backup'));
+            $courseid = \restore_dbops::create_new_course($fullname, $shortname, $categoryid);
+            $rc = new \restore_controller($backupdir, $courseid, \backup::INTERACTIVE_NO, \backup::MODE_GENERAL,
+                $USER->id, \backup::TARGET_NEW_COURSE);
+            if (!$rc->execute_precheck()) {
+                $results = $rc->get_precheck_results();
+                if (!empty($results['errors'])) {
+                    throw new moodle_exception('Restore precheck failed: ' . json_encode($results['errors']));
+                }
             }
+            $rc->execute_plan();
+        } catch (\Throwable $e) {
+            // Do not leave an empty half-restored course behind.
+            if ($rc) {
+                $rc->destroy();
+                $rc = null;
+            }
+            if ($courseid) {
+                try {
+                    delete_course($courseid, false);
+                } catch (\Throwable $ignored) {
+                    // Report the original error, not the cleanup one.
+                }
+            }
+            throw $e;
+        } finally {
+            if ($rc) {
+                $rc->destroy();
+            }
+            @unlink($mbz);
+            fulldelete($path);
         }
-        $rc->execute_plan();
-        $rc->destroy();
-        @unlink($mbz);
 
         $upd = ['id' => $courseid];
         if (!empty($args['fullname'])) {
