@@ -12,6 +12,7 @@ Claude Desktop / Claude Code ──stdio──► mcp-server/moodle_mcp.py ─�
 | `mcp-server/` | Python-MCP-palvelin |
 | `tests/e2e_test.py` | Päästä päähän -testi oikeaa Moodlea vastaan |
 | `scripts/build-plugin-zip.sh` | Tekee asennettavan `local_claudeapi.zip`-paketin |
+| `scripts/update-plugin.sh` | Päivittää lisäosan Moodleen ja MCP-palvelimen riippuvuudet tästä reposta |
 
 Kaksi osaa:
 
@@ -40,6 +41,15 @@ sudo -u www-data php admin/cli/upgrade.php --non-interactive
 ```
 
 **Selaimella:** *Ylläpito → Lisäosat → Asenna lisäosa*. Tämä toimii vain, jos www-data saa kirjoittaa `local`-kansioon. Yleensä se ei saa, ja hyvä niin.
+
+### Päivitys
+
+Kun repoon tulee uusi versio, aja Moodle-koneella omana käyttäjänäsi (ilman sudoa):
+```bash
+~/MoodleCloudePlugin/scripts/update-plugin.sh              # git pull + lisäosa + Moodlen upgrade + Python-riippuvuudet
+~/MoodleCloudePlugin/scripts/update-plugin.sh --branch X   # pull requestin haaran testaus
+```
+Lopuksi käynnistä Claude-sovellus uudelleen, jotta MCP-palvelimen uusi versio latautuu. Moodle-hakemiston voi antaa ympäristömuuttujalla `MOODLE_DIR` (oletus `/var/www/moodle`).
 
 ## 2. Web-palvelut ja token
 
@@ -115,6 +125,8 @@ claude mcp add moodle \
 | Tentit | `import_questions` (GIFT / Moodle XML, lisää suoraan tenttiin), `remove_quiz_question` |
 | Varmuuskopiot | `backup_course` (.mbz Macille), `restore_course` (.mbz → uusi kurssi muokattavaksi) |
 | Tiedostot | `upload_file` (mikä tahansa tiedosto mille tahansa tiedostoalueelle, isot tiedostot 4 Mt:n paloissa), `download_file` (mikä tahansa tallennettu tiedosto koneelle), `list_files`, `delete_file` |
+| Kaikki muu | `ws_functions` + `ws_call`: mikä tahansa Moodlen oma web-palvelufunktio (käyttäjät, kurssille liittäminen, ryhmät, arvosanat, foorumiviestit, kategoriat, kalenteri, kohortit, merkit …) |
+| Asetukset | `get_config`, `set_config`: sivuston ja lisäosien asetukset (samat kuin *Site administration* -sivuilla), muutokset kirjataan asetusmuutosten raporttiin |
 | Muut | `raw_action` (mikä tahansa lisäosan toiminto) |
 
 Myös suoritusehdot (`completion`, `completionview`, `completionsubmit`, …) ja pääsyrajoitukset (`availability`) toimivat.
