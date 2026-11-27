@@ -130,11 +130,12 @@ class api {
      * @param int $itemid
      * @param string $filepath
      * @param string $filename
-     * @param string $content
+     * @param string $content file content (ignored when $pathname is given)
+     * @param string|null $pathname local file to store instead of $content (e.g. a chunked upload)
      * @return \stored_file
      */
     protected static function store_file(int $contextid, string $component, string $filearea, int $itemid,
-            string $filepath, string $filename, string $content): \stored_file {
+            string $filepath, string $filename, string $content, ?string $pathname = null): \stored_file {
         global $USER;
         $fs = get_file_storage();
         $filename = clean_param($filename, PARAM_FILE);
@@ -146,11 +147,37 @@ class api {
         if ($old = $fs->get_file($contextid, $component, $filearea, $itemid, $filepath, $filename)) {
             $old->delete();
         }
-        return $fs->create_file_from_string([
+        $record = [
             'contextid' => $contextid, 'component' => $component, 'filearea' => $filearea,
             'itemid' => $itemid, 'filepath' => $filepath, 'filename' => $filename,
             'userid' => $USER->id,
-        ], $content);
+        ];
+        if ($pathname !== null) {
+            return $fs->create_file_from_pathname($record, $pathname);
+        }
+        return $fs->create_file_from_string($record, $content);
+    }
+
+    /**
+     * File content from args: either inline content_b64 or a finished chunked upload (upload_id).
+     * @param array $f
+     * @return array [content, pathname|null]
+     */
+    protected static function file_source(array $f): array {
+        if (!empty($f['upload_id'])) {
+            return ['', self::upload_path($f['upload_id'])];
+        }
+        return [self::b64(self::req($f, 'content_b64')), null];
+    }
+
+    /**
+     * Remove the temp file of a chunked upload once it has been stored.
+     * @param string|null $pathname
+     */
+    protected static function cleanup_upload(?string $pathname): void {
+        if ($pathname !== null) {
+            @unlink($pathname);
+        }
     }
 
     /**
@@ -163,8 +190,10 @@ class api {
         $draftid = file_get_unused_draft_itemid();
         $usercontext = context_user::instance($USER->id);
         foreach ($files as $f) {
+            [$content, $pathname] = self::file_source($f);
             self::store_file($usercontext->id, 'user', 'draft', $draftid, $f['filepath'] ?? '/',
-                self::req($f, 'filename'), self::b64(self::req($f, 'content_b64')));
+                self::req($f, 'filename'), $content, $pathname);
+            self::cleanup_upload($pathname);
         }
         return $draftid;
     }
@@ -573,9 +602,11 @@ class api {
             $ctx = context_module::instance($cmid);
             [, $defaultarea] = self::main_text_area($modname);
             foreach ($args['files'] as $f) {
+                [$content, $pathname] = self::file_source($f);
                 $file = self::store_file($ctx->id, 'mod_' . $modname, $f['filearea'] ?? $defaultarea,
                     (int)($f['itemid'] ?? 0), $f['filepath'] ?? '/', self::req($f, 'filename'),
-                    self::b64(self::req($f, 'content_b64')));
+                    $content, $pathname);
+                self::cleanup_upload($pathname);
                 $stored[] = self::placeholder($file->get_filepath(), $file->get_filename());
             }
         }
@@ -728,15 +759,18 @@ class api {
 
     /**
      * Upload any file into any file area.
-     * args: cmid|courseid, component?, filearea, itemid?, filepath?, filename, content_b64
+     * args: cmid|courseid, component?, filearea, itemid?, filepath?, filename, content_b64 | upload_id
+     * (upload_id = a file sent in chunks with begin_upload + append_upload, for large files)
      * @param array $args
      * @return array
      */
     protected static function upload_file(array $args): array {
         [$ctx, $component] = self::target_context($args);
+        [$content, $pathname] = self::file_source($args);
         $file = self::store_file($ctx->id, $args['component'] ?? $component, self::req($args, 'filearea'),
             (int)($args['itemid'] ?? 0), $args['filepath'] ?? '/', self::req($args, 'filename'),
-            self::b64(self::req($args, 'content_b64')));
+            $content, $pathname);
+        self::cleanup_upload($pathname);
         return ['fileid' => (int)$file->get_id(), 'size' => (int)$file->get_filesize(),
             'mimetype' => $file->get_mimetype(),
             'placeholder' => self::placeholder($file->get_filepath(), $file->get_filename())];

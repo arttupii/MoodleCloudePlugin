@@ -58,7 +58,7 @@ Working rules:
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-mcp = MCPServer("moodle", instructions=INSTRUCTIONS, version="0.1.0")
+mcp = MCPServer("moodle", instructions=INSTRUCTIONS, version="0.2.0")
 
 _backed_up: set[int] = set()
 _created: set[int] = set()
@@ -112,6 +112,38 @@ def b64_file(path: str) -> tuple[str, str]:
     return p.name, base64.b64encode(p.read_bytes()).decode()
 
 
+def file_payload(path: str, name: str | None = None) -> dict[str, Any]:
+    """Send a local file to Moodle: inline base64 when small, otherwise in CHUNK-sized pieces
+    (begin_upload + append_upload) so size is not limited by PHP post_max_size or memory.
+    Returns {"filename", "content_b64"} or {"filename", "upload_id"}."""
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        raise MoodleError(f"File not found: {p}")
+    filename = name or p.name
+    if p.stat().st_size <= CHUNK:
+        return {"filename": filename, "content_b64": base64.b64encode(p.read_bytes()).decode()}
+    up = call("begin_upload")["upload_id"]
+    with open(p, "rb") as fh:
+        while chunk := fh.read(CHUNK):
+            call("append_upload", {"upload_id": up, "content_b64": base64.b64encode(chunk).decode()})
+    return {"filename": filename, "upload_id": up}
+
+
+def download_stored_file(file_id: int, target: Path) -> Path:
+    """Download a stored Moodle file to `target` in CHUNK-sized pieces."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    offset = 0
+    with open(target, "wb") as fh:
+        while True:
+            part = call("read_file", {"fileid": file_id, "offset": offset, "length": CHUNK})
+            data = base64.b64decode(part["content_b64"])
+            fh.write(data)
+            offset += len(data)
+            if part["eof"] or not data:
+                break
+    return target
+
+
 def ensure_backup(course_id: int) -> str | None:
     """Back up an existing course once per session before the first modification."""
     if not AUTO_BACKUP or course_id in _backed_up or course_id in _created:
@@ -130,16 +162,7 @@ def download_backup(course_id: int, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = out_dir / f"course{course_id}-{stamp}-{info['filename']}"
-    offset = 0
-    with open(target, "wb") as fh:
-        while True:
-            part = call("read_file", {"fileid": info["fileid"], "offset": offset, "length": CHUNK})
-            data = base64.b64decode(part["content_b64"])
-            fh.write(data)
-            offset += len(data)
-            if part["eof"] or not data:
-                break
-    return target
+    return download_stored_file(int(info["fileid"]), target)
 
 
 def with_backup(result: dict[str, Any], backup: str | None) -> dict[str, Any]:
@@ -275,11 +298,7 @@ def add_activity(course_id: int, section: int, modname: str, fields: dict,
     b = ensure_backup(course_id)
     args: dict[str, Any] = {"courseid": course_id, "section": section, "modname": modname, "fields": fields}
     if attachments:
-        files = []
-        for p in attachments:
-            name, data = b64_file(p)
-            files.append({"filename": name, "content_b64": data})
-        args["draft_files"] = {"files": files}
+        args["draft_files"] = {"files": [file_payload(p) for p in attachments]}
     return with_backup(call("add_module", args), b)
 
 
@@ -361,12 +380,15 @@ def add_image(alt: str, path: str | None = None, svg: str | None = None, filenam
 
 @mcp.tool()
 def upload_file(path: str, filearea: str, cm_id: int | None = None, course_id: int | None = None,
-                component: str | None = None, itemid: int = 0) -> dict:
-    """Low-level: put a local file into any file area. Returns @@PLUGINFILE@@ placeholder for use in HTML.
+                component: str | None = None, itemid: int = 0, filepath: str | None = None) -> dict:
+    """Low-level: put a local file (any type, any size – large files go in chunks) into any file area.
+    Returns @@PLUGINFILE@@ placeholder for use in HTML.
     E.g. page content: cm_id + filearea "content"; intro: filearea "intro"; book chapter: filearea "chapter" +
-    itemid=chapterid; section summary: course_id + filearea "section" + itemid=section id."""
-    name, data = b64_file(path)
-    args: dict[str, Any] = {"filearea": filearea, "itemid": itemid, "filename": name, "content_b64": data}
+    itemid=chapterid; section summary: course_id + filearea "section" + itemid=section id;
+    resource file: cm_id + filearea "content" + itemid 0; folder: cm_id + filearea "content" + filepath."""
+    args: dict[str, Any] = {"filearea": filearea, "itemid": itemid, **file_payload(path)}
+    if filepath:
+        args["filepath"] = filepath
     if cm_id:
         args["cmid"] = cm_id
     elif course_id:
@@ -382,6 +404,21 @@ def upload_file(path: str, filearea: str, cm_id: int | None = None, course_id: i
 def list_files(cm_id: int | None = None, course_id: int | None = None) -> dict:
     """List stored files of an activity or course (fileid, area, name, size)."""
     return call("list_files", {"cmid": cm_id} if cm_id else {"courseid": course_id})
+
+
+@mcp.tool()
+def download_file(file_id: int, out_path: str | None = None) -> dict:
+    """Download any stored Moodle file (file_id from list_files) to this computer, in chunks (any size).
+    out_path: target file or directory (default BACKUP_DIR/files/). Existing files are not overwritten."""
+    target = Path(os.path.expanduser(out_path)) if out_path else BACKUP_DIR / "files"
+    if out_path is None or target.is_dir() or (out_path or "").endswith(("/", os.sep)):
+        first = call("read_file", {"fileid": file_id, "offset": 0, "length": 0})
+        target = target / first["filename"]
+    if target.exists():
+        stem, suffix = target.stem, target.suffix
+        target = target.with_name(f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}{suffix}")
+    download_stored_file(file_id, target)
+    return {"saved_to": str(target), "size_bytes": target.stat().st_size}
 
 
 @mcp.tool(annotations=DESTRUCTIVE)

@@ -114,7 +114,8 @@ claude mcp add moodle \
 | Kirja | `add_book_chapter`, `update_book_chapter`, `delete_book_chapter` |
 | Tentit | `import_questions` (GIFT / Moodle XML, lisää suoraan tenttiin), `remove_quiz_question` |
 | Varmuuskopiot | `backup_course` (.mbz Macille), `restore_course` (.mbz → uusi kurssi muokattavaksi) |
-| Muut | `upload_file`, `delete_file`, `raw_action` (mikä tahansa lisäosan toiminto) |
+| Tiedostot | `upload_file` (mikä tahansa tiedosto mille tahansa tiedostoalueelle, isot tiedostot 4 Mt:n paloissa), `download_file` (mikä tahansa tallennettu tiedosto koneelle), `list_files`, `delete_file` |
+| Muut | `raw_action` (mikä tahansa lisäosan toiminto) |
 
 Myös suoritusehdot (`completion`, `completionview`, `completionsubmit`, …) ja pääsyrajoitukset (`availability`) toimivat.
 
@@ -134,7 +135,8 @@ Myös suoritusehdot (`completion`, `completionview`, `completionsubmit`, …) ja
 ## Vianetsintä
 - `accessexception` / `invalidtoken`: aja `setup.php` uudelleen ja tarkista token.
 - `Cannot reach Moodle`: tarkista, että MOODLE_URL aukeaa Macin selaimessa. Osoitteen pitää olla sama kuin `$CFG->wwwroot` Moodlen `config.php`:ssä.
-- Isot .mbz-tiedostot siirretään 4 Mt:n paloissa, joten PHP:n `post_max_size` ei ole esteenä.
+- Yli 4 Mt:n tiedostot (`upload_file`, liitteet, `restore_course`, `download_file`, `backup_course`) siirretään 4 Mt:n paloissa, joten PHP:n `post_max_size` ei rajoita kokoa.
+- MCP-palvelimen 0.2.0-versio vaatii lisäosan 0.2.0-version (`upload_id`-tuki). Päivitä molemmat yhtä aikaa.
 
 ## Testaus
 ```bash
