@@ -13,6 +13,7 @@ Claude Desktop / Claude Code ──stdio──► mcp-server/moodle_mcp.py ─�
 | `tests/e2e_test.py` | Päästä päähän -testi oikeaa Moodlea vastaan |
 | `scripts/build-plugin-zip.sh` | Tekee asennettavan `local_claudeapi.zip`-paketin |
 | `scripts/update-plugin.sh` | Päivittää lisäosan Moodleen ja MCP-palvelimen riippuvuudet tästä reposta |
+| `scripts/install-moodle.sh` | Asentaa kehitys-Moodlen (5.3 LTS) Ubuntu 24.04- / Linux Mint 22 -koneelle |
 
 Kaksi osaa:
 
@@ -21,7 +22,26 @@ Kaksi osaa:
 
 > ⚠️ Asenna lisäosa **vain omaan kehitys-Moodleen**. Token antaa täydet ylläpitäjän oikeudet. Valmis kurssi siirretään tuotantoon .mbz-varmuuskopiona.
 
-Testattu: Moodle 5.0.12 ja 5.1.9, PostgreSQL 16, PHP 8.3, Python 3.11, mcp 2.3.
+Testattu: Moodle 5.0.12 ja 5.1.9, PostgreSQL 16, PHP 8.3, Python 3.11, mcp 2.3. Lisäksi Moodle 5.3.1+ ja MariaDB 11.4 Linux Mint 22:lla (`scripts/install-moodle.sh`).
+
+---
+
+## 0. Kehitys-Moodlen asennus (valinnainen)
+
+Jos sinulla ei vielä ole omaa kehitys-Moodlea, `scripts/install-moodle.sh` asentaa sen tyhjälle Ubuntu 24.04-, Linux Mint 22- tai Debian 13 -koneelle. Skripti asentaa Apachen, PHP:n, MariaDB 11.4:n MariaDB:n omasta repositoriosta (jakeluiden oma 10.11 ei riitä Moodle 5.3:lle) ja Moodlen 5.3 LTS -version gitistä. Lisäksi se tekee tietokannan, cronin ja Apache-asetukset ja asentaa Moodlen komentoriviltä.
+
+```bash
+sudo bash scripts/install-moodle.sh
+# Asetuksia voi muuttaa ympäristömuuttujilla, esim.:
+sudo SITE_URL=http://192.168.1.50 ADMIN_PASS='Salasana-123!' bash scripts/install-moodle.sh
+```
+
+Lopuksi skripti tulostaa admin-tunnukset ja tietokannan salasanat. Ota ne talteen.
+
+Huomioita:
+- `SITE_URL` on Moodlen `wwwroot`. MCP-palvelimen `MOODLE_URL`:n pitää olla **täsmälleen** sama: `localhost` ja `127.0.0.1` tulkitaan eri osoitteiksi, ja Moodle vastaa silloin HTTP 303 -uudelleenohjauksella.
+- Jos MCP-palvelin pyörii eri koneella kuin Moodle, käytä `SITE_URL`:na Moodle-koneen IP-osoitetta.
+- Skripti on tarkoitettu vain kehityskäyttöön: Moodlen koodikansio on www-data-käyttäjän omistuksessa, eikä HTTPS:ää ole käytössä.
 
 ---
 
