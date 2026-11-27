@@ -51,6 +51,9 @@ Working rules:
 - Completion (course must have completion enabled, new courses do): cm fields completion=2 (automatic),
   completionview=1, completionpassgrade=1, completionexpected=<ts>; module fields e.g. assign.completionsubmit=1,
   quiz: cm.completionpassgrade=1 + completiongradeitemnumber=0.
+- Anything the course tools do not cover (users, enrolments, groups, grades, forum posts, categories, calendar,
+  cohorts, badges, ...): find a Moodle web service function with ws_functions, then call it with ws_call.
+  Site/plugin settings: get_config / set_config.
 - Availability JSON examples:
   after activity completed: {"op":"&","c":[{"type":"completion","cm":<cmid>,"e":1}],"showc":[true]}
   from a date: {"op":"&","c":[{"type":"date","d":">=","t":<unix ts>}],"showc":[true]}
@@ -58,7 +61,7 @@ Working rules:
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-mcp = MCPServer("moodle", instructions=INSTRUCTIONS, version="0.2.0")
+mcp = MCPServer("moodle", instructions=INSTRUCTIONS, version="0.3.0")
 
 _backed_up: set[int] = set()
 _created: set[int] = set()
@@ -521,6 +524,58 @@ def restore_course(mbz_path: str, category_id: int | None = None, fullname: str 
     res = call("restore_course", args, timeout=1800)
     _created.add(int(res["courseid"]))
     return res
+
+
+# --------------------------------------------------------------------------------------------------
+# Any Moodle web service function + site/plugin settings
+# --------------------------------------------------------------------------------------------------
+
+@mcp.tool(annotations=RO)
+def ws_functions(search: str | None = None, component: str | None = None, name: str | None = None) -> dict:
+    """Find Moodle's own web service functions (hundreds: users, enrolments, groups, grades, forums,
+    calendar, cohorts, badges, competencies, categories, ...), or describe one function's parameters.
+    search: part of the name, e.g. "enrol", "core_group_", "mod_forum_". name: full function name to describe.
+    Typical flow: ws_functions(search=...) -> ws_functions(name=...) -> ws_call(...)."""
+    args: dict[str, Any] = {}
+    for k, v in (("search", search), ("component", component), ("name", name)):
+        if v:
+            args[k] = v
+    return call("ws_functions", args)
+
+
+@mcp.tool()
+def ws_call(function: str, params: dict | None = None) -> dict:
+    """Call any Moodle web service function as the site admin, e.g.
+    core_user_create_users, enrol_manual_enrol_users, core_group_create_groups, core_course_create_categories,
+    mod_forum_add_discussion, core_calendar_create_calendar_events, core_cohort_create_cohorts.
+    params: exactly the function's parameters (check them with ws_functions(name=...)).
+    Creating/deleting users, enrolments or data in bulk: tell the user what will happen and get an OK first."""
+    return call("ws_call", {"function": function, "params": params or {}}, timeout=900)
+
+
+@mcp.tool(annotations=RO)
+def get_config(plugin: str | None = None, name: str | None = None, show_secrets: bool = False) -> dict:
+    """Read site or plugin settings (what Site administration pages show).
+    plugin: empty/"core" for core settings, or a component like "mod_assign", "theme_boost", "enrol_self".
+    name: one setting; without it, all settings of the plugin (passwords masked unless show_secrets)."""
+    args: dict[str, Any] = {"show_secrets": show_secrets}
+    if plugin:
+        args["plugin"] = plugin
+    if name:
+        args["name"] = name
+    return call("get_config", args)
+
+
+@mcp.tool()
+def set_config(name: str, value: str | int | float | bool | None, plugin: str | None = None,
+               purge_caches: bool = False) -> dict:
+    """Change a site or plugin setting (logged to the config changes report). value=None unsets it.
+    plugin: empty/"core" for core, or e.g. "mod_quiz". Check the current value with get_config first and
+    tell the user what you change. purge_caches=True for settings that affect themes/language/caching."""
+    args: dict[str, Any] = {"name": name, "value": value, "purge_caches": purge_caches}
+    if plugin:
+        args["plugin"] = plugin
+    return call("set_config", args)
 
 
 # --------------------------------------------------------------------------------------------------
