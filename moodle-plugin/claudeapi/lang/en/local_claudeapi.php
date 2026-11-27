@@ -16,3 +16,4 @@
 defined('MOODLE_INTERNAL') || die();
 
 $string['pluginname'] = 'Claude API (course authoring)';
+$string['wscallerror'] = 'Web service call failed: {$a}';

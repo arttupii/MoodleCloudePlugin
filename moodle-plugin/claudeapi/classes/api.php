@@ -34,6 +34,7 @@ class api {
         'add_book_chapter', 'update_book_chapter', 'delete_book_chapter',
         'import_questions', 'remove_quiz_slot', 'repaginate_quiz',
         'backup_course', 'begin_upload', 'append_upload', 'restore_course',
+        'ws_functions', 'ws_call', 'get_config', 'set_config',
     ];
 
     /** @var \testing_data_generator|null */
@@ -130,11 +131,12 @@ class api {
      * @param int $itemid
      * @param string $filepath
      * @param string $filename
-     * @param string $content
+     * @param string $content file content (ignored when $pathname is given)
+     * @param string|null $pathname local file to store instead of $content (e.g. a chunked upload)
      * @return \stored_file
      */
     protected static function store_file(int $contextid, string $component, string $filearea, int $itemid,
-            string $filepath, string $filename, string $content): \stored_file {
+            string $filepath, string $filename, string $content, ?string $pathname = null): \stored_file {
         global $USER;
         $fs = get_file_storage();
         $filename = clean_param($filename, PARAM_FILE);
@@ -146,11 +148,37 @@ class api {
         if ($old = $fs->get_file($contextid, $component, $filearea, $itemid, $filepath, $filename)) {
             $old->delete();
         }
-        return $fs->create_file_from_string([
+        $record = [
             'contextid' => $contextid, 'component' => $component, 'filearea' => $filearea,
             'itemid' => $itemid, 'filepath' => $filepath, 'filename' => $filename,
             'userid' => $USER->id,
-        ], $content);
+        ];
+        if ($pathname !== null) {
+            return $fs->create_file_from_pathname($record, $pathname);
+        }
+        return $fs->create_file_from_string($record, $content);
+    }
+
+    /**
+     * File content from args: either inline content_b64 or a finished chunked upload (upload_id).
+     * @param array $f
+     * @return array [content, pathname|null]
+     */
+    protected static function file_source(array $f): array {
+        if (!empty($f['upload_id'])) {
+            return ['', self::upload_path($f['upload_id'])];
+        }
+        return [self::b64(self::req($f, 'content_b64')), null];
+    }
+
+    /**
+     * Remove the temp file of a chunked upload once it has been stored.
+     * @param string|null $pathname
+     */
+    protected static function cleanup_upload(?string $pathname): void {
+        if ($pathname !== null) {
+            @unlink($pathname);
+        }
     }
 
     /**
@@ -163,8 +191,10 @@ class api {
         $draftid = file_get_unused_draft_itemid();
         $usercontext = context_user::instance($USER->id);
         foreach ($files as $f) {
+            [$content, $pathname] = self::file_source($f);
             self::store_file($usercontext->id, 'user', 'draft', $draftid, $f['filepath'] ?? '/',
-                self::req($f, 'filename'), self::b64(self::req($f, 'content_b64')));
+                self::req($f, 'filename'), $content, $pathname);
+            self::cleanup_upload($pathname);
         }
         return $draftid;
     }
@@ -573,9 +603,11 @@ class api {
             $ctx = context_module::instance($cmid);
             [, $defaultarea] = self::main_text_area($modname);
             foreach ($args['files'] as $f) {
+                [$content, $pathname] = self::file_source($f);
                 $file = self::store_file($ctx->id, 'mod_' . $modname, $f['filearea'] ?? $defaultarea,
                     (int)($f['itemid'] ?? 0), $f['filepath'] ?? '/', self::req($f, 'filename'),
-                    self::b64(self::req($f, 'content_b64')));
+                    $content, $pathname);
+                self::cleanup_upload($pathname);
                 $stored[] = self::placeholder($file->get_filepath(), $file->get_filename());
             }
         }
@@ -728,15 +760,18 @@ class api {
 
     /**
      * Upload any file into any file area.
-     * args: cmid|courseid, component?, filearea, itemid?, filepath?, filename, content_b64
+     * args: cmid|courseid, component?, filearea, itemid?, filepath?, filename, content_b64 | upload_id
+     * (upload_id = a file sent in chunks with begin_upload + append_upload, for large files)
      * @param array $args
      * @return array
      */
     protected static function upload_file(array $args): array {
         [$ctx, $component] = self::target_context($args);
+        [$content, $pathname] = self::file_source($args);
         $file = self::store_file($ctx->id, $args['component'] ?? $component, self::req($args, 'filearea'),
             (int)($args['itemid'] ?? 0), $args['filepath'] ?? '/', self::req($args, 'filename'),
-            self::b64(self::req($args, 'content_b64')));
+            $content, $pathname);
+        self::cleanup_upload($pathname);
         return ['fileid' => (int)$file->get_id(), 'size' => (int)$file->get_filesize(),
             'mimetype' => $file->get_mimetype(),
             'placeholder' => self::placeholder($file->get_filepath(), $file->get_filename())];
@@ -1203,5 +1238,168 @@ class api {
         }
         $course = $DB->get_record('course', ['id' => $courseid], 'id, fullname, shortname');
         return ['courseid' => (int)$course->id, 'fullname' => $course->fullname, 'shortname' => $course->shortname];
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Generic access: any Moodle web service function, site and plugin settings.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Find Moodle web service functions, or describe one.
+     * args: search? (substring of the function name, e.g. "enrol" or "core_group_"), component?, name? (describe one)
+     * @param array $args
+     * @return array
+     */
+    protected static function ws_functions(array $args): array {
+        global $DB;
+        if (!empty($args['name'])) {
+            $info = \core_external\external_api::external_function_info($args['name']);
+            return [
+                'name' => $info->name, 'component' => $info->component, 'type' => $info->type ?? '',
+                'description' => $info->description ?? '',
+                'capabilities' => $info->capabilities ?? '',
+                'parameters' => self::describe_external($info->parameters_desc),
+                'returns' => $info->returns_desc ? self::describe_external($info->returns_desc) : null,
+            ];
+        }
+        $where = '1 = 1';
+        $params = [];
+        if (!empty($args['search'])) {
+            $where .= ' AND ' . $DB->sql_like('name', ':search', false);
+            $params['search'] = '%' . $DB->sql_like_escape($args['search']) . '%';
+        }
+        if (!empty($args['component'])) {
+            $where .= ' AND component = :component';
+            $params['component'] = $args['component'];
+        }
+        $recs = $DB->get_records_select('external_functions', $where, $params, 'name', 'id, name, component', 0, 300);
+        return ['count' => count($recs),
+            'functions' => array_values(array_map(fn($r) => $r->name, $recs)),
+            'hint' => 'Describe one with name=<function> to see its parameters, then call it with ws_call.'];
+    }
+
+    /**
+     * Turn an external_description tree into a plain array (for showing parameters to Claude).
+     * @param mixed $desc
+     * @param int $depth
+     * @return mixed
+     */
+    protected static function describe_external($desc, int $depth = 0) {
+        if ($depth > 12) {
+            return '...';
+        }
+        if ($desc instanceof \core_external\external_value) {
+            $out = ['type' => $desc->type, 'desc' => $desc->desc];
+            if ($desc->required == VALUE_OPTIONAL) {
+                $out['optional'] = true;
+            } else if ($desc->required == VALUE_DEFAULT) {
+                $out['default'] = $desc->default;
+            }
+            return $out;
+        }
+        if ($desc instanceof \core_external\external_multiple_structure) {
+            return ['list_of' => self::describe_external($desc->content, $depth + 1), 'desc' => $desc->desc,
+                'optional' => $desc->required != VALUE_REQUIRED];
+        }
+        if ($desc instanceof \core_external\external_single_structure) {
+            $keys = [];
+            foreach ($desc->keys as $k => $v) {
+                $keys[$k] = self::describe_external($v, $depth + 1);
+            }
+            return $keys;
+        }
+        return (string)get_class($desc);
+    }
+
+    /**
+     * Call any Moodle web service function (core_*, enrol_*, mod_*, tool_*, ...) as the site admin.
+     * The function does not have to be part of the Claude API service.
+     * args: function, params (object, exactly as the function's parameters)
+     * @param array $args
+     * @return array
+     */
+    protected static function ws_call(array $args): array {
+        $function = (string)self::req($args, 'function');
+        if ($function === 'local_claudeapi_execute') {
+            throw new invalid_parameter_exception('Use the actions directly instead of calling local_claudeapi_execute');
+        }
+        $params = $args['params'] ?? [];
+        if (!is_array($params)) {
+            throw new invalid_parameter_exception('params must be an object');
+        }
+        $response = \core_external\external_api::call_external_function($function, $params, false);
+        if (!empty($response['error'])) {
+            $e = $response['exception'];
+            throw new moodle_exception('wscallerror', 'local_claudeapi', '',
+                $function . ': ' . ($e->errorcode ?? '') . ' ' . ($e->message ?? '') .
+                (!empty($e->debuginfo) ? ' | ' . $e->debuginfo : ''));
+        }
+        return ['function' => $function, 'result' => $response['data']];
+    }
+
+    /**
+     * Read settings. args: plugin? ("core" or empty = core, e.g. "mod_assign", "theme_boost"), name?
+     * Without name returns all settings of the plugin. Passwords are masked unless show_secrets=true.
+     * @param array $args
+     * @return array
+     */
+    protected static function get_config(array $args): array {
+        $plugin = self::config_plugin($args);
+        if (!empty($args['name'])) {
+            $value = get_config($plugin ?? 'core', $args['name']);
+            return ['plugin' => $plugin ?? 'core', 'name' => $args['name'],
+                'exists' => $value !== false, 'value' => $value === false ? null : $value];
+        }
+        $all = (array)get_config($plugin ?? 'core');
+        if (empty($args['show_secrets'])) {
+            foreach ($all as $k => $v) {
+                if (preg_match('/pass|secret|token|key$/i', $k) && $v !== '') {
+                    $all[$k] = '***';
+                }
+            }
+        }
+        ksort($all);
+        return ['plugin' => $plugin ?? 'core', 'count' => count($all), 'settings' => $all];
+    }
+
+    /**
+     * Change a setting (same effect as saving it in Site administration; logged to the config changes report).
+     * args: name, value (null = unset), plugin? (empty/"core" = core), purge_caches? (bool)
+     * @param array $args
+     * @return array
+     */
+    protected static function set_config(array $args): array {
+        $plugin = self::config_plugin($args);
+        $name = (string)self::req($args, 'name');
+        if (!array_key_exists('value', $args)) {
+            throw new invalid_parameter_exception("Missing argument 'value' (null unsets the setting)");
+        }
+        $old = get_config($plugin ?? 'core', $name);
+        $value = $args['value'];
+        if (is_bool($value)) {
+            $value = (int)$value;
+        } else if (is_array($value)) {
+            $value = json_encode($value);
+        }
+        add_to_config_log($name, $old === false ? null : (string)$old, $value === null ? null : (string)$value, $plugin);
+        set_config($name, $value, $plugin);
+        if (!empty($args['purge_caches'])) {
+            purge_all_caches();
+        }
+        return ['plugin' => $plugin ?? 'core', 'name' => $name, 'old' => $old === false ? null : $old,
+            'new' => get_config($plugin ?? 'core', $name)];
+    }
+
+    /**
+     * Normalise the plugin argument for config functions.
+     * @param array $args
+     * @return string|null null = core
+     */
+    protected static function config_plugin(array $args): ?string {
+        $plugin = trim((string)($args['plugin'] ?? ''));
+        if ($plugin === '' || $plugin === 'core' || $plugin === 'moodle') {
+            return null;
+        }
+        return clean_param($plugin, PARAM_COMPONENT) ?: throw new invalid_parameter_exception("Invalid plugin '$plugin'");
     }
 }
